@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+backend/venv/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Node
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# Downloaded media
+*.mp4
+*.mkv
+*.webm
+*.mp3
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
