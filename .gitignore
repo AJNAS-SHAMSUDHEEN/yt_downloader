@@ -9,6 +9,8 @@ backend/venv/
 .env
 .env.*
 !.env.example
+*cookies.txt
+cookies.txt
 
 # Node
 node_modules/
