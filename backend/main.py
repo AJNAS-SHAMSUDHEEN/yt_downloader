@@ -286,6 +286,23 @@ async def download(req: DownloadRequest):
         ) from exc
 
 
+# ─── Cookie & Client Helper ───────────────────────────────────────────────────
+
+def _get_cookie_file() -> str | None:
+    """Find or materialize cookies for yt-dlp to bypass bot verification."""
+    if os.path.exists("cookies.txt"):
+        return "cookies.txt"
+    env_path = os.environ.get("COOKIES_FILE")
+    if env_path and os.path.exists(env_path):
+        return env_path
+    raw_cookies = os.environ.get("YOUTUBE_COOKIES")
+    if raw_cookies and raw_cookies.strip():
+        cookie_path = Path(tempfile.gettempdir()) / "yt_cookies.txt"
+        cookie_path.write_text(raw_cookies.strip(), encoding="utf-8")
+        return str(cookie_path)
+    return None
+
+
 # ─── Download logic ───────────────────────────────────────────────────────────
 
 async def _do_download(
@@ -326,6 +343,12 @@ async def _do_download(
                 }
             ],
 
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android", "ios", "mweb"]
+                }
+            },
+
             "quiet": True,
             "no_warnings": True,
 
@@ -364,6 +387,12 @@ async def _do_download(
 
             "outtmpl": outtmpl,
 
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android", "ios", "mweb"]
+                }
+            },
+
             "quiet": True,
             "no_warnings": True,
 
@@ -374,6 +403,11 @@ async def _do_download(
             "noplaylist": True,
             "max_filesize": MAX_FILESIZE_BYTES,
         }
+
+    # Apply cookies if present
+    cookie_path = _get_cookie_file()
+    if cookie_path:
+        ydl_opts["cookiefile"] = cookie_path
 
     # ──────────────────────────────────────────────────────────────────────────
     # RUN YT-DLP
@@ -391,6 +425,15 @@ async def _do_download(
     except yt_dlp.utils.DownloadError as exc:
 
         msg = str(exc)
+
+        if "Sign in to confirm you’re not a bot" in msg or "bot" in msg.lower():
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "YouTube requested bot verification for this server IP. "
+                    "Please set the YOUTUBE_COOKIES environment variable in Render with your exported cookies.txt."
+                ),
+            )
 
         if (
             "Video unavailable" in msg
