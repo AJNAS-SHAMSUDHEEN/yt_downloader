@@ -474,13 +474,20 @@ async def _do_download(
                     download=True,
                 )
         except yt_dlp.utils.DownloadError as first_err:
-            # If clean attempt failed and cookies are configured, fallback to authenticated attempt
+            first_msg = str(first_err)
             if cookie_path:
                 ydl_opts["cookiefile"] = cookie_path
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(
-                        url,
-                        download=True,
+                try:
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        info = ydl.extract_info(
+                            url,
+                            download=True,
+                        )
+                except yt_dlp.utils.DownloadError as second_err:
+                    second_msg = str(second_err)
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"Clean: {_clean_ytdlp_error(first_msg)} | Cookies: {_clean_ytdlp_error(second_msg)}",
                     )
             else:
                 raise first_err
