@@ -290,16 +290,32 @@ async def download(req: DownloadRequest):
 
 def _get_cookie_file() -> str | None:
     """Find or materialize cookies for yt-dlp to bypass bot verification."""
+    # 1. Local cookies.txt file
     if os.path.exists("cookies.txt"):
         return "cookies.txt"
+
+    # 2. Path provided via COOKIES_FILE env var
     env_path = os.environ.get("COOKIES_FILE")
     if env_path and os.path.exists(env_path):
         return env_path
+
+    # 3. Cookies content provided via YOUTUBE_COOKIES env var (raw text or base64)
     raw_cookies = os.environ.get("YOUTUBE_COOKIES")
     if raw_cookies and raw_cookies.strip():
+        content = raw_cookies.strip()
+        # Attempt base64 decoding if not starting with Netscape header or standard comments
+        if not content.startswith("#") and len(content) > 20:
+            try:
+                import base64
+                decoded = base64.b64decode(content).decode("utf-8")
+                if "# Netscape" in decoded or "\t" in decoded:
+                    content = decoded
+            except Exception:
+                pass
         cookie_path = Path(tempfile.gettempdir()) / "yt_cookies.txt"
-        cookie_path.write_text(raw_cookies.strip(), encoding="utf-8")
+        cookie_path.write_text(content, encoding="utf-8")
         return str(cookie_path)
+
     return None
 
 
