@@ -360,6 +360,7 @@ async def _do_download(
             ],
 
             "js_runtimes": {
+                "deno": {},
                 "node": {}
             },
 
@@ -404,6 +405,7 @@ async def _do_download(
             "outtmpl": outtmpl,
 
             "js_runtimes": {
+                "deno": {},
                 "node": {}
             },
 
