@@ -73,7 +73,13 @@ export default function App() {
     try {
       setStatus(STATUS.DOWNLOADING);
 
-      const response = await fetch('http://localhost:8000/download', {
+      if (typeof navigator !== 'undefined' && !navigator.onLine) {
+        throw new Error('You are currently offline. Downloading media requires an active internet connection and working backend.');
+      }
+
+      const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').replace(/\/$/, '');
+
+      const response = await fetch(`${apiBaseUrl}/download`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: url.trim(), type, quality }),
@@ -111,7 +117,13 @@ export default function App() {
 
       setStatus(STATUS.DONE);
     } catch (err) {
-      setErrorMsg(err.message || 'Something went wrong. Please try again.');
+      if (typeof navigator !== 'undefined' && !navigator.onLine) {
+        setErrorMsg('You are offline. Downloading media requires an active internet connection.');
+      } else if (err.name === 'TypeError') {
+        setErrorMsg('Unable to connect to the backend server. Please verify your connection.');
+      } else {
+        setErrorMsg(err.message || 'Something went wrong. Please try again.');
+      }
       setStatus(STATUS.ERROR);
     }
   };

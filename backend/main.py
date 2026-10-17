@@ -1,7 +1,8 @@
-
+import asyncio
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import urllib.parse
 from pathlib import Path
@@ -20,19 +21,38 @@ app = FastAPI(
     version="1.0.0",
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
+# Parse explicit allowed origins from environment (comma-separated), falling back to local dev
+_raw_origins = os.environ.get("ALLOWED_ORIGINS", "").strip()
+if _raw_origins:
+    ALLOWED_ORIGINS = [orig.strip() for orig in _raw_origins.split(",") if orig.strip()]
+else:
+    ALLOWED_ORIGINS = [
         "http://localhost:5173",
         "http://127.0.0.1:5173",
-    ],
+        "http://localhost:4173",
+        "http://127.0.0.1:4173",
+        "http://localhost:3000",
+    ]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
-    allow_methods=["POST", "GET"],
+    allow_methods=["POST", "GET", "OPTIONS"],
     allow_headers=["Content-Type"],
 )
 
 
-# ─── Constants ────────────────────────────────────────────────────────────────
+# ─── Constants & Limits ────────────────────────────────────────────────────────
+
+ALLOWED_SCHEMES = {"http", "https"}
+ALLOWED_HOSTS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+    "youtu.be",
+}
 
 YOUTUBE_URL_PATTERNS = [
     re.compile(
@@ -51,10 +71,12 @@ YOUTUBE_URL_PATTERNS = [
 
 DOWNLOAD_TIMEOUT = 300
 MAX_URL_LENGTH = 200
+MAX_FILESIZE_BYTES = 500 * 1024 * 1024  # 500 MB max to protect server resources
+MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", 2))
+DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
 
 # ─── Models ───────────────────────────────────────────────────────────────────
-
 
 class DownloadRequest(BaseModel):
     url: str
@@ -80,11 +102,20 @@ VALID_AUDIO_QUALITIES = {
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
-
 def is_valid_youtube_url(url: str) -> bool:
-    """Check if the URL matches known YouTube URL patterns."""
+    """Validate submitted URL against allowed schemes, hosts, and YouTube patterns."""
 
     if not url or len(url) > MAX_URL_LENGTH:
+        return False
+
+    try:
+        parsed = urllib.parse.urlparse(url.strip())
+        if parsed.scheme.lower() not in ALLOWED_SCHEMES:
+            return False
+        host = (parsed.netloc or "").lower().split(":")[0]
+        if host not in ALLOWED_HOSTS:
+            return False
+    except Exception:
         return False
 
     return any(
@@ -94,9 +125,15 @@ def is_valid_youtube_url(url: str) -> bool:
 
 
 def check_ffmpeg() -> bool:
-    """Return True if ffmpeg is available on PATH."""
+    """Return True if FFmpeg is available on PATH."""
 
     return shutil.which("ffmpeg") is not None
+
+
+def check_ffprobe() -> bool:
+    """Return True if FFprobe is available on PATH."""
+
+    return shutil.which("ffprobe") is not None
 
 
 def sanitize_filename(name: str) -> str:
@@ -130,12 +167,12 @@ def make_content_disposition(filename: str) -> str:
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
 
-
 @app.get("/health")
 def health():
     return {
         "status": "ok",
         "ffmpeg": check_ffmpeg(),
+        "ffprobe": check_ffprobe(),
     }
 
 
@@ -182,7 +219,7 @@ async def download(req: DownloadRequest):
         if quality not in VALID_AUDIO_QUALITIES:
             quality = "best"
 
-    # 2. Check FFmpeg availability
+    # 2. Check FFmpeg
 
     if not check_ffmpeg():
         raise HTTPException(
@@ -200,13 +237,13 @@ async def download(req: DownloadRequest):
     )
 
     try:
-
-        output_path, filename = await _do_download(
-            url,
-            download_type,
-            quality,
-            tmp_dir,
-        )
+        async with DOWNLOAD_SEMAPHORE:
+            output_path, filename = await _do_download(
+                url,
+                download_type,
+                quality,
+                tmp_dir,
+            )
 
         media_type = (
             "audio/mpeg"
@@ -249,8 +286,7 @@ async def download(req: DownloadRequest):
         ) from exc
 
 
-# ─── Download logic ────────────────────────────────────────────────────────────
-
+# ─── Download logic ───────────────────────────────────────────────────────────
 
 async def _do_download(
     url: str,
@@ -258,7 +294,7 @@ async def _do_download(
     quality: str,
     tmp_dir: str,
 ):
-    """Download media with yt-dlp and return (path, filename)."""
+    """Download media with yt-dlp."""
 
     outtmpl = os.path.join(
         tmp_dir,
@@ -266,7 +302,7 @@ async def _do_download(
     )
 
     # ──────────────────────────────────────────────────────────────────────────
-    # AUDIO
+    # AUDIO DOWNLOAD
     # ──────────────────────────────────────────────────────────────────────────
 
     if download_type == "audio":
@@ -298,19 +334,14 @@ async def _do_download(
             "retries": 3,
 
             "noplaylist": True,
+            "max_filesize": MAX_FILESIZE_BYTES,
         }
 
     # ──────────────────────────────────────────────────────────────────────────
-    # VIDEO
+    # VIDEO DOWNLOAD
     # ──────────────────────────────────────────────────────────────────────────
 
     else:
-
-        # Best quality
-        #
-        # bv* = best available video format
-        # ba  = best available audio format
-        # b   = fallback combined format
 
         if quality == "best":
 
@@ -329,10 +360,9 @@ async def _do_download(
         ydl_opts = {
             "format": fmt,
 
-            "outtmpl": outtmpl,
+            "format_sort": ["vcodec:h264", "acodec:m4a", "ext:mp4"],
 
-            # Ask FFmpeg to merge into MP4 where possible.
-            "merge_output_format": "mp4",
+            "outtmpl": outtmpl,
 
             "quiet": True,
             "no_warnings": True,
@@ -342,6 +372,7 @@ async def _do_download(
             "retries": 3,
 
             "noplaylist": True,
+            "max_filesize": MAX_FILESIZE_BYTES,
         }
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -435,12 +466,7 @@ async def _do_download(
             detail="Download produced no output file.",
         )
 
-    # Prefer the largest media file.
-
-    output_file = max(
-        files,
-        key=lambda file: file.stat().st_size,
-    )
+    # Get title from YouTube information
 
     title = sanitize_filename(
         info.get(
@@ -449,15 +475,175 @@ async def _do_download(
         )
     )
 
-    ext = output_file.suffix
+    # ──────────────────────────────────────────────────────────────────────────
+    # AUDIO
+    # ──────────────────────────────────────────────────────────────────────────
 
-    filename = f"{title}{ext}"
+    if download_type == "audio":
+
+        output_file = max(
+            files,
+            key=lambda file: file.stat().st_size,
+        )
+
+        filename = f"{title}.mp3"
+
+        return str(output_file), filename
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # VIDEO
+    # ──────────────────────────────────────────────────────────────────────────
+
+    # Find the downloaded video file.
+    #
+    # We intentionally do NOT trust the original codec/container.
+    # YouTube can give us AV1 + Opus, VP9 + Opus, etc.
+    #
+    # We will explicitly convert it to:
+    #
+    # H.264 + AAC + MP4
+
+    video_extensions = {
+        ".mp4",
+        ".mkv",
+        ".webm",
+        ".mov",
+        ".avi",
+    }
+
+    video_files = [
+        file
+        for file in files
+        if file.suffix.lower() in video_extensions
+    ]
+
+    if not video_files:
+
+        raise HTTPException(
+            status_code=500,
+            detail="No video file was produced.",
+        )
+
+    input_file = max(
+        video_files,
+        key=lambda file: file.stat().st_size,
+    )
+
+    # Final compatible MP4
+
+    output_file = tmp_path / f"{title}_converted.mp4"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # FFMPEG CONVERSION
+    # ──────────────────────────────────────────────────────────────────────────
+
+    ffmpeg_command = [
+        "ffmpeg",
+
+        "-y",
+
+        "-i",
+        str(input_file),
+
+        # Video codec
+        "-c:v",
+        "libx264",
+
+        # Encoding quality
+        "-preset",
+        "medium",
+
+        "-crf",
+        "23",
+
+        # Audio codec
+        "-c:a",
+        "aac",
+
+        # Audio bitrate
+        "-b:a",
+        "192k",
+
+        # Better MP4 streaming compatibility
+        "-movflags",
+        "+faststart",
+
+        str(output_file),
+    ]
+
+    try:
+
+        result = subprocess.run(
+            ffmpeg_command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=DOWNLOAD_TIMEOUT,
+        )
+
+    except subprocess.TimeoutExpired as exc:
+
+        raise HTTPException(
+            status_code=500,
+            detail="Video conversion timed out.",
+        ) from exc
+
+    except Exception as exc:
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"FFmpeg conversion failed: {exc}"
+            ),
+        ) from exc
+
+    if result.returncode != 0:
+
+        error_message = (
+            result.stderr.strip()
+            if result.stderr
+            else "Unknown FFmpeg error."
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Video conversion failed: "
+                f"{error_message[-500:]}"
+            ),
+        )
+
+    # Verify final file exists
+
+    if not output_file.exists():
+
+        raise HTTPException(
+            status_code=500,
+            detail="FFmpeg did not produce the final MP4 file.",
+        )
+
+    if output_file.stat().st_size == 0:
+
+        raise HTTPException(
+            status_code=500,
+            detail="Final MP4 file is empty.",
+        )
+
+    # Remove original downloaded file
+
+    try:
+
+        input_file.unlink()
+
+    except Exception:
+        pass
+
+    filename = f"{title}.mp4"
 
     return str(output_file), filename
 
 
 # ─── Error cleanup ─────────────────────────────────────────────────────────────
-
 
 def _clean_ytdlp_error(msg: str) -> str:
     """Strip verbose yt-dlp prefix and traceback from errors."""
@@ -479,17 +665,21 @@ def _clean_ytdlp_error(msg: str) -> str:
 
 # ─── Cleanup task ─────────────────────────────────────────────────────────────
 
-
 class _CleanupTask:
     """Background task that deletes the temporary directory."""
 
     def __init__(self, directory: str):
-
         self.directory = directory
 
     async def __call__(self):
-
         shutil.rmtree(
             self.directory,
             ignore_errors=True,
         )
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
