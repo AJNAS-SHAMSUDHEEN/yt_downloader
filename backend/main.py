@@ -359,10 +359,8 @@ async def _do_download(
                 }
             ],
 
-            "extractor_args": {
-                "youtube": {
-                    "player_client": ["android", "ios", "mweb"]
-                }
+            "js_runtimes": {
+                "node": {}
             },
 
             "quiet": True,
@@ -384,7 +382,7 @@ async def _do_download(
 
         if quality == "best":
 
-            fmt = "bv*+ba/b"
+            fmt = "bv*+ba/best"
 
         else:
 
@@ -393,7 +391,7 @@ async def _do_download(
             fmt = (
                 f"bv*[height<={height}]+ba/"
                 f"b[height<={height}]/"
-                f"bv*+ba/b"
+                f"bv*+ba/best"
             )
 
         ydl_opts = {
@@ -403,10 +401,8 @@ async def _do_download(
 
             "outtmpl": outtmpl,
 
-            "extractor_args": {
-                "youtube": {
-                    "player_client": ["android", "ios", "mweb"]
-                }
+            "js_runtimes": {
+                "node": {}
             },
 
             "quiet": True,
@@ -420,10 +416,16 @@ async def _do_download(
             "max_filesize": MAX_FILESIZE_BYTES,
         }
 
-    # Apply cookies if present
+    # Apply cookies or fallback player clients
     cookie_path = _get_cookie_file()
     if cookie_path:
         ydl_opts["cookiefile"] = cookie_path
+    else:
+        ydl_opts["extractor_args"] = {
+            "youtube": {
+                "player_client": ["android", "ios", "mweb", "web"]
+            }
+        }
 
     # ──────────────────────────────────────────────────────────────────────────
     # RUN YT-DLP
