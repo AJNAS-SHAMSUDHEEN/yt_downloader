@@ -399,6 +399,8 @@ async def _do_download(
 
             "format_sort": ["vcodec:h264", "acodec:m4a", "ext:mp4"],
 
+            "merge_output_format": "mp4",
+
             "outtmpl": outtmpl,
 
             "js_runtimes": {
@@ -590,116 +592,124 @@ async def _do_download(
         key=lambda file: file.stat().st_size,
     )
 
-    # Final compatible MP4
+    filename = f"{title}.mp4"
 
-    output_file = tmp_path / f"{title}_converted.mp4"
+    # If already a valid MP4 from yt-dlp, return directly without wasting CPU
+    if input_file.suffix.lower() == ".mp4":
+        return str(input_file), filename
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # FFMPEG CONVERSION
-    # ──────────────────────────────────────────────────────────────────────────
+    # Otherwise (e.g. .mkv or .webm), fast remux to MP4
+    output_file = tmp_path / f"{title}_final.mp4"
 
-    ffmpeg_command = [
+    # Attempt 1: Instant stream copy (-c copy takes ~1 second and almost 0 CPU)
+    remux_cmd = [
         "ffmpeg",
-
         "-y",
-
         "-i",
         str(input_file),
-
-        # Video codec
-        "-c:v",
-        "libx264",
-
-        # Encoding quality
-        "-preset",
-        "medium",
-
-        "-crf",
-        "23",
-
-        # Audio codec
-        "-c:a",
-        "aac",
-
-        # Audio bitrate
-        "-b:a",
-        "192k",
-
-        # Better MP4 streaming compatibility
+        "-c",
+        "copy",
         "-movflags",
         "+faststart",
-
         str(output_file),
     ]
 
     try:
-
         result = subprocess.run(
-            ffmpeg_command,
+            remux_cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=DOWNLOAD_TIMEOUT,
+            timeout=30,
         )
+    except Exception:
+        result = None
 
-    except subprocess.TimeoutExpired as exc:
+    if result and result.returncode == 0 and output_file.exists() and output_file.stat().st_size > 0:
+        try:
+            input_file.unlink()
+        except Exception:
+            pass
+        return str(output_file), filename
 
-        raise HTTPException(
-            status_code=500,
-            detail="Video conversion timed out.",
-        ) from exc
-
-    except Exception as exc:
-
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                f"FFmpeg conversion failed: {exc}"
-            ),
-        ) from exc
-
-    if result.returncode != 0:
-
-        error_message = (
-            result.stderr.strip()
-            if result.stderr
-            else "Unknown FFmpeg error."
-        )
-
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Video conversion failed: "
-                f"{error_message[-500:]}"
-            ),
-        )
-
-    # Verify final file exists
-
-    if not output_file.exists():
-
-        raise HTTPException(
-            status_code=500,
-            detail="FFmpeg did not produce the final MP4 file.",
-        )
-
-    if output_file.stat().st_size == 0:
-
-        raise HTTPException(
-            status_code=500,
-            detail="Final MP4 file is empty.",
-        )
-
-    # Remove original downloaded file
+    # Attempt 2: Copy video, convert audio to AAC (very fast, ~2-3 seconds)
+    audio_transcode_cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_file),
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-movflags",
+        "+faststart",
+        str(output_file),
+    ]
 
     try:
+        result = subprocess.run(
+            audio_transcode_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=45,
+        )
+    except Exception:
+        result = None
 
+    if result and result.returncode == 0 and output_file.exists() and output_file.stat().st_size > 0:
+        try:
+            input_file.unlink()
+        except Exception:
+            pass
+        return str(output_file), filename
+
+    # Fallback: ultrafast video encoding
+    ultrafast_cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_file),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "25",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-movflags",
+        "+faststart",
+        str(output_file),
+    ]
+
+    try:
+        result = subprocess.run(
+            ultrafast_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=45,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Video conversion failed: {exc}",
+        ) from exc
+
+    if not output_file.exists() or output_file.stat().st_size == 0:
+        # If output_file wasn't created, return input_file as fallback
+        return str(input_file), f"{title}{input_file.suffix}"
+
+    try:
         input_file.unlink()
-
     except Exception:
         pass
-
-    filename = f"{title}.mp4"
 
     return str(output_file), filename
 
