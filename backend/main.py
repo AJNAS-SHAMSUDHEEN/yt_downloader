@@ -173,6 +173,9 @@ def health():
         "status": "ok",
         "ffmpeg": check_ffmpeg(),
         "ffprobe": check_ffprobe(),
+        "node": shutil.which("node") is not None,
+        "deno": shutil.which("deno") is not None,
+        "has_cookies": bool(os.environ.get("YOUTUBE_COOKIES")),
     }
 
 
