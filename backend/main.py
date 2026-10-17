@@ -169,6 +169,16 @@ def make_content_disposition(filename: str) -> str:
 
 @app.get("/health")
 def health():
+    cookie_file = _get_cookie_file()
+    cookies_count = 0
+    if cookie_file:
+        try:
+            import http.cookiejar
+            cj = http.cookiejar.MozillaCookieJar()
+            cj.load(cookie_file)
+            cookies_count = len(cj)
+        except Exception:
+            cookies_count = -1
     return {
         "status": "ok",
         "ffmpeg": check_ffmpeg(),
@@ -176,6 +186,7 @@ def health():
         "node": shutil.which("node") is not None,
         "deno": shutil.which("deno") is not None,
         "has_cookies": bool(os.environ.get("YOUTUBE_COOKIES")),
+        "cookies_count": cookies_count,
     }
 
 
@@ -306,17 +317,38 @@ def _get_cookie_file() -> str | None:
     raw_cookies = os.environ.get("YOUTUBE_COOKIES")
     if raw_cookies and raw_cookies.strip():
         content = raw_cookies.strip()
-        # Attempt base64 decoding if not starting with Netscape header or standard comments
+        # Attempt base64 decoding if not starting with Netscape header
         if not content.startswith("#") and len(content) > 20:
             try:
                 import base64
                 decoded = base64.b64decode(content).decode("utf-8")
-                if "# Netscape" in decoded or "\t" in decoded:
+                if "# Netscape" in decoded or "\t" in decoded or ".youtube.com" in decoded:
                     content = decoded
             except Exception:
                 pass
+
+        # Normalize to standard tab-separated Netscape format
+        normalized_lines = []
+        if not content.startswith("#"):
+            normalized_lines.append("# Netscape HTTP Cookie File")
+            normalized_lines.append("# https://curl.haxx.se/rfc/cookie_spec.html")
+            normalized_lines.append("# This is a generated file! Do not edit.\n")
+
+        for line in content.splitlines():
+            line_str = line.strip()
+            if not line_str or line_str.startswith("#"):
+                normalized_lines.append(line_str)
+                continue
+            # If not tab-separated, convert space-separated fields into tabs
+            if "\t" not in line_str:
+                parts = line_str.split(None, 6)
+                if len(parts) == 7:
+                    line_str = "\t".join(parts)
+            normalized_lines.append(line_str)
+
+        final_cookie_text = "\n".join(normalized_lines) + "\n"
         cookie_path = Path(tempfile.gettempdir()) / "yt_cookies.txt"
-        cookie_path.write_text(content, encoding="utf-8")
+        cookie_path.write_text(final_cookie_text, encoding="utf-8")
         return str(cookie_path)
 
     return None
