@@ -399,6 +399,8 @@ async def _do_download(
                 "node": {}
             },
 
+            "remote_components": ["ejs:github"],
+
             "quiet": True,
             "no_warnings": True,
 
@@ -444,6 +446,8 @@ async def _do_download(
                 "node": {}
             },
 
+            "remote_components": ["ejs:github"],
+
             "quiet": True,
             "no_warnings": True,
 
@@ -455,30 +459,31 @@ async def _do_download(
             "max_filesize": MAX_FILESIZE_BYTES,
         }
 
-    # Apply cookies if present
     cookie_path = _get_cookie_file()
-    if cookie_path:
-        ydl_opts["cookiefile"] = cookie_path
-
-    # Always use resilient player clients with visionos first (visionos does not trigger PO token or bot verification)
-    ydl_opts["extractor_args"] = {
-        "youtube": {
-            "player_client": ["visionos", "ios", "android", "mweb", "web"]
-        }
-    }
 
     # ──────────────────────────────────────────────────────────────────────────
     # RUN YT-DLP
     # ──────────────────────────────────────────────────────────────────────────
 
     try:
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-
-            info = ydl.extract_info(
-                url,
-                download=True,
-            )
+        # First attempt: Clean download with default visionos client (bypasses bot verification)
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(
+                    url,
+                    download=True,
+                )
+        except yt_dlp.utils.DownloadError as first_err:
+            # If clean attempt failed and cookies are configured, fallback to authenticated attempt
+            if cookie_path:
+                ydl_opts["cookiefile"] = cookie_path
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(
+                        url,
+                        download=True,
+                    )
+            else:
+                raise first_err
 
     except yt_dlp.utils.DownloadError as exc:
 
