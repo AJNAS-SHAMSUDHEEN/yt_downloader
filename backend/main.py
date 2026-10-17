@@ -455,16 +455,17 @@ async def _do_download(
             "max_filesize": MAX_FILESIZE_BYTES,
         }
 
-    # Apply cookies or fallback player clients
+    # Apply cookies if present
     cookie_path = _get_cookie_file()
     if cookie_path:
         ydl_opts["cookiefile"] = cookie_path
-    else:
-        ydl_opts["extractor_args"] = {
-            "youtube": {
-                "player_client": ["android", "ios", "mweb", "web"]
-            }
+
+    # Always use resilient player clients with visionos first (visionos does not trigger PO token or bot verification)
+    ydl_opts["extractor_args"] = {
+        "youtube": {
+            "player_client": ["visionos", "ios", "android", "mweb", "web"]
         }
+    }
 
     # ──────────────────────────────────────────────────────────────────────────
     # RUN YT-DLP
@@ -483,12 +484,11 @@ async def _do_download(
 
         msg = str(exc)
 
-        if "Sign in to confirm you’re not a bot" in msg or "bot" in msg.lower():
+        if "Sign in to confirm you’re not a bot" in msg:
             raise HTTPException(
                 status_code=403,
                 detail=(
-                    "YouTube requested bot verification for this server IP. "
-                    "Please set the YOUTUBE_COOKIES environment variable in Render with your exported cookies.txt."
+                    f"YouTube requested bot verification: {_clean_ytdlp_error(msg)}"
                 ),
             )
 
