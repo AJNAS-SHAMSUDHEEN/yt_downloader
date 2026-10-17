@@ -553,10 +553,7 @@ async def _do_download(
 
         raise HTTPException(
             status_code=500,
-            detail=(
-                "An unexpected error occurred "
-                "during download."
-            ),
+            detail=f"Unexpected error ({type(exc).__name__}): {exc}",
         ) from exc
 
     # ──────────────────────────────────────────────────────────────────────────
