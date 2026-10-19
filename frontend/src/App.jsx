@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import './App.css';
 
 const VIDEO_QUALITIES = [
@@ -34,6 +34,12 @@ const STATUS_MESSAGES = {
   [STATUS.ERROR]: '',
 };
 
+function extractVideoId(url) {
+  if (!url) return null;
+  const match = url.trim().match(/(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=|shorts\/))([\w-]{11})/);
+  return match ? match[1] : null;
+}
+
 function isValidYouTubeUrl(url) {
   const patterns = [
     /^https?:\/\/(www\.)?youtube\.com\/watch\?.*v=[\w-]+/,
@@ -54,8 +60,73 @@ export default function App() {
   const [progressSpeed, setProgressSpeed] = useState('');
   const [progressEta, setProgressEta] = useState('');
   const [progressMessage, setProgressMessage] = useState('');
+  const [videoPreview, setVideoPreview] = useState(null);
+  const [loadingPreview, setLoadingPreview] = useState(false);
 
   const qualities = type === 'video' ? VIDEO_QUALITIES : AUDIO_QUALITIES;
+
+  // Instant preview when a valid YouTube link is entered/pasted
+  useEffect(() => {
+    const videoId = extractVideoId(url);
+    if (!videoId) {
+      setVideoPreview(null);
+      setLoadingPreview(false);
+      return;
+    }
+
+    const defaultThumb = `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`;
+    setVideoPreview((prev) => {
+      if (prev && prev.id === videoId) return prev;
+      return {
+        id: videoId,
+        title: 'Loading video info...',
+        author: '',
+        thumbnail: defaultThumb,
+      };
+    });
+    setLoadingPreview(true);
+
+    const controller = new AbortController();
+    fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`, {
+      signal: controller.signal,
+    })
+      .then((res) => {
+        if (!res.ok) throw new Error('oEmbed unavailable');
+        return res.json();
+      })
+      .then((data) => {
+        setVideoPreview({
+          id: videoId,
+          title: data.title || 'YouTube Video',
+          author: data.author_name || '',
+          thumbnail: data.thumbnail_url || defaultThumb,
+        });
+        setLoadingPreview(false);
+      })
+      .catch((err) => {
+        if (err.name !== 'AbortError') {
+          setVideoPreview((prev) => (prev ? { ...prev, title: 'YouTube Video' } : null));
+          setLoadingPreview(false);
+        }
+      });
+
+    return () => controller.abort();
+  }, [url]);
+
+  const handlePaste = async () => {
+    try {
+      if (navigator.clipboard && navigator.clipboard.readText) {
+        const text = await navigator.clipboard.readText();
+        if (text) {
+          const trimmed = text.trim();
+          setUrl(trimmed);
+          if (status === STATUS.ERROR || status === STATUS.DONE) setStatus(STATUS.IDLE);
+        }
+      }
+    } catch (err) {
+      console.warn('Clipboard read error:', err);
+    }
+  };
 
   const handleDownload = async () => {
     setErrorMsg('');
@@ -215,8 +286,81 @@ export default function App() {
                 autoComplete="off"
                 spellCheck={false}
               />
+              <div className="input-actions">
+                {url && (
+                  <button
+                    type="button"
+                    className="input-action-btn clear-btn"
+                    onClick={() => {
+                      setUrl('');
+                      setVideoPreview(null);
+                      if (status === STATUS.ERROR || status === STATUS.DONE) setStatus(STATUS.IDLE);
+                    }}
+                    title="Clear input"
+                    disabled={isLoading}
+                    aria-label="Clear URL input"
+                  >
+                    <svg width="12" height="12" viewBox="0 0 14 14" fill="none">
+                      <path d="M2 2l10 10M12 2L2 12" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+                    </svg>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="input-action-btn paste-btn"
+                  onClick={handlePaste}
+                  title="Paste from clipboard"
+                  disabled={isLoading}
+                  aria-label="Paste from clipboard"
+                >
+                  <svg width="13" height="13" viewBox="0 0 16 16" fill="none">
+                    <path d="M5.5 2.5h5a1 1 0 011 1v1h1a1.5 1.5 0 011.5 1.5v7a1.5 1.5 0 01-1.5 1.5h-8A1.5 1.5 0 013 13V6a1.5 1.5 0 011.5-1.5h1v-1a1 1 0 011-1z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
+                    <path d="M5.5 4.5h5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+                  </svg>
+                  <span>Paste</span>
+                </button>
+              </div>
             </div>
           </div>
+
+          {/* Instant Video Preview Card */}
+          {videoPreview && (
+            <div className="video-preview-card">
+              <div className="preview-thumb-wrap">
+                <img
+                  src={videoPreview.thumbnail}
+                  alt={videoPreview.title}
+                  className="preview-thumb"
+                  loading="eager"
+                  onError={(e) => {
+                    e.currentTarget.src = `https://img.youtube.com/vi/${videoPreview.id}/0.jpg`;
+                  }}
+                />
+                <div className="preview-play-badge">
+                  <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+                    <polygon points="4,2 4,12 12,7" fill="#0D0D0D" />
+                  </svg>
+                </div>
+              </div>
+              <div className="preview-details">
+                <div className="preview-badge">
+                  <span className="preview-pulse-dot" />
+                  Ready to download
+                </div>
+                <h3 className="preview-title" title={videoPreview.title}>
+                  {videoPreview.title}
+                </h3>
+                {videoPreview.author && (
+                  <p className="preview-author">
+                    <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
+                      <path d="M8 8a3 3 0 100-6 3 3 0 000 6zm-5 6a5 5 0 0110 0H3z" />
+                    </svg>
+                    {videoPreview.author}
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
 
           {/* Type selector */}
           <div className="type-group">
