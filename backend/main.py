@@ -699,24 +699,28 @@ def _do_download_sync(
 
         except yt_dlp.utils.DownloadError as first_err:
             first_msg = str(first_err)
-            logger.warning("First attempt failed: %s", _clean_ytdlp_error(first_msg))
+            logger.warning("Clean attempt failed: %s", _clean_ytdlp_error(first_msg))
             if cookie_path:
-                ydl_opts["cookiefile"] = cookie_path
+                cookie_opts = {
+                    **ydl_opts,
+                    "cookiefile": cookie_path,
+                    "extractor_args": {
+                        "youtube": {
+                            "player_client": ["web", "mweb", "android", "ios"],
+                        }
+                    },
+                }
                 try:
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    with yt_dlp.YoutubeDL(cookie_opts) as ydl:
                         info = ydl.extract_info(url, download=True)
                 except yt_dlp.utils.DownloadError as second_err:
-                    second_msg = str(second_err)
-                    raise HTTPException(
-                        status_code=403,
-                        detail=(
-                            f"Download failed even with cookies. "
-                            f"Clean: {_clean_ytdlp_error(first_msg)} | "
-                            f"Cookies: {_clean_ytdlp_error(second_msg)}"
-                        ),
-                    )
+                    logger.warning("Cookie attempt failed: %s", _clean_ytdlp_error(str(second_err)))
+                    raise second_err
             else:
                 raise first_err
+
+    except HTTPException:
+        raise
 
     except yt_dlp.utils.DownloadError as exc:
         msg = str(exc)
@@ -729,7 +733,7 @@ def _do_download_sync(
         ):
             raise HTTPException(
                 status_code=403,
-                detail="YouTube requested bot verification for this server IP. Providing cookies or retrying resolves this.",
+                detail="YouTube requested bot verification for this server IP. Providing updated cookies or retrying resolves this.",
             )
         if "Video unavailable" in msg or "not available" in msg.lower():
             raise HTTPException(status_code=400, detail="This video is unavailable.")
@@ -751,7 +755,7 @@ def _do_download_sync(
         logger.exception("Unexpected error during yt-dlp extraction")
         raise HTTPException(
             status_code=500,
-            detail=f"Unexpected error ({type(exc).__name__}): {exc}",
+            detail=f"Unexpected error: {exc}",
         ) from exc
 
     # Locate the downloaded file -----------------------------------------------
