@@ -50,6 +50,10 @@ export default function App() {
   const [quality, setQuality] = useState('best');
   const [status, setStatus] = useState(STATUS.IDLE);
   const [errorMsg, setErrorMsg] = useState('');
+  const [progress, setProgress] = useState(0);
+  const [progressSpeed, setProgressSpeed] = useState('');
+  const [progressEta, setProgressEta] = useState('');
+  const [progressMessage, setProgressMessage] = useState('');
 
   const qualities = type === 'video' ? VIDEO_QUALITIES : AUDIO_QUALITIES;
 
@@ -68,62 +72,86 @@ export default function App() {
       return;
     }
 
+    setProgress(0);
+    setProgressSpeed('');
+    setProgressEta('');
+    setProgressMessage('Connecting to YouTube...');
     setStatus(STATUS.PROCESSING);
 
     try {
-      setStatus(STATUS.DOWNLOADING);
-
       if (typeof navigator !== 'undefined' && !navigator.onLine) {
-        throw new Error('You are currently offline. Downloading media requires an active internet connection and working backend.');
+        throw new Error('You are currently offline. Downloading media requires an active internet connection.');
       }
 
       const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').replace(/\/$/, '');
 
-      const response = await fetch(`${apiBaseUrl}/download`, {
+      const startRes = await fetch(`${apiBaseUrl}/download/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: url.trim(), type, quality }),
       });
 
-      if (!response.ok) {
+      if (!startRes.ok) {
         let errData;
         try {
-          errData = await response.json();
+          errData = await startRes.json();
         } catch {
           errData = { detail: 'An unexpected error occurred. Please try again.' };
         }
-        throw new Error(errData.detail || 'Download failed.');
+        throw new Error(errData.detail || 'Download failed to start.');
       }
 
-      setStatus(STATUS.PREPARING);
+      const { task_id: taskId } = await startRes.json();
+      setStatus(STATUS.DOWNLOADING);
 
-      const blob = await response.blob();
-      const contentDisposition = response.headers.get('Content-Disposition') || '';
-      let filename = type === 'audio' ? 'audio.mp3' : 'video.mp4';
+      // Poll progress every 300ms
+      await new Promise((resolve, reject) => {
+        const pollInterval = setInterval(async () => {
+          try {
+            const progRes = await fetch(`${apiBaseUrl}/download/progress/${taskId}`);
+            if (!progRes.ok) {
+              clearInterval(pollInterval);
+              reject(new Error('Lost connection to download session.'));
+              return;
+            }
 
-      // Prefer RFC 5987 filename* (percent-encoded UTF-8) over ASCII filename.
-      // Pattern: filename*=UTF-8''<percent-encoded>
-      const rfc5987Match = contentDisposition.match(/filename\*=UTF-8''([^;\r\n]+)/i);
-      if (rfc5987Match) {
-        filename = decodeURIComponent(rfc5987Match[1].trim());
-      } else {
-        // Fallback: plain filename="..."
-        const asciiMatch = contentDisposition.match(/filename="([^"]+)"/i);
-        if (asciiMatch) {
-          filename = asciiMatch[1];
-        }
-      }
+            const data = await progRes.json();
 
-      const blobUrl = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = blobUrl;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(blobUrl);
+            if (typeof data.progress === 'number') {
+              setProgress(data.progress);
+            }
+            if (data.speed) setProgressSpeed(data.speed);
+            if (data.eta) setProgressEta(data.eta);
+            if (data.message) setProgressMessage(data.message);
 
-      setStatus(STATUS.DONE);
+            if (data.status === 'processing') {
+              setStatus(STATUS.PREPARING);
+            } else if (data.status === 'complete') {
+              clearInterval(pollInterval);
+              setProgress(100);
+              setProgressMessage('Download completed ✓');
+              setStatus(STATUS.DONE);
+
+              // Trigger direct file download
+              const fileUrl = `${apiBaseUrl}/download/file/${taskId}`;
+              const a = document.createElement('a');
+              a.href = fileUrl;
+              a.download = data.filename || (type === 'audio' ? 'audio.mp3' : 'video.mp4');
+              document.body.appendChild(a);
+              a.click();
+              document.body.removeChild(a);
+
+              resolve();
+            } else if (data.status === 'error') {
+              clearInterval(pollInterval);
+              reject(new Error(data.error || 'Download failed.'));
+            }
+          } catch (err) {
+            clearInterval(pollInterval);
+            reject(err);
+          }
+        }, 300);
+      });
     } catch (err) {
       if (typeof navigator !== 'undefined' && !navigator.onLine) {
         setErrorMsg('You are offline. Downloading media requires an active internet connection.');
@@ -253,7 +281,7 @@ export default function App() {
             {isLoading ? (
               <>
                 <span className="spinner" />
-                {STATUS_MESSAGES[status]}
+                {progress > 0 ? `Downloading ${Math.round(progress)}%` : STATUS_MESSAGES[status]}
               </>
             ) : (
               <>
@@ -265,35 +293,53 @@ export default function App() {
             )}
           </button>
 
-          {/* Status / Error */}
-          {status !== STATUS.IDLE && (
-            <div
-              className={`status-bar ${
-                status === STATUS.ERROR
-                  ? 'status-error'
-                  : status === STATUS.DONE
-                  ? 'status-done'
-                  : 'status-loading'
-              }`}
-              aria-live="polite"
-            >
-              {status === STATUS.ERROR ? (
-                <>
-                  <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                    <circle cx="8" cy="8" r="7" stroke="currentColor" strokeWidth="1.5" />
-                    <path d="M8 5v3.5M8 11v.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-                  </svg>
-                  {errorMsg}
-                </>
-              ) : status === STATUS.DONE ? (
-                <>
-                  <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                    <circle cx="8" cy="8" r="7" stroke="currentColor" strokeWidth="1.5" />
-                    <path d="M5 8l2.5 2.5L11 5.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-                  </svg>
-                  {STATUS_MESSAGES[status]}
-                </>
-              ) : null}
+          {/* Progress Card during download */}
+          {isLoading && (
+            <div className="progress-card">
+              <div className="progress-header">
+                <div className="progress-label">
+                  <span className="progress-pulse" />
+                  <span>{progressMessage || 'Downloading...'}</span>
+                </div>
+                <span className="progress-percentage">{Math.round(progress)}%</span>
+              </div>
+
+              <div className="progress-track">
+                <div
+                  className="progress-fill"
+                  style={{ width: `${Math.max(progress, 3)}%` }}
+                />
+              </div>
+
+              {(progressSpeed || progressEta) && (
+                <div className="progress-footer">
+                  {progressSpeed && <span>Speed: {progressSpeed}</span>}
+                  {progressSpeed && progressEta && <span className="progress-separator">•</span>}
+                  {progressEta && <span>ETA: {progressEta}</span>}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Success Status */}
+          {!isLoading && status === STATUS.DONE && (
+            <div className="status-bar status-done" aria-live="polite">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                <circle cx="8" cy="8" r="7" stroke="currentColor" strokeWidth="1.5" />
+                <path d="M5 8l2.5 2.5L11 5.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              Download completed! File is saving to your downloads.
+            </div>
+          )}
+
+          {/* Error Status */}
+          {!isLoading && status === STATUS.ERROR && (
+            <div className="status-bar status-error" aria-live="polite">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                <circle cx="8" cy="8" r="7" stroke="currentColor" strokeWidth="1.5" />
+                <path d="M8 5v3.5M8 11v.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+              </svg>
+              {errorMsg}
             </div>
           )}
         </main>

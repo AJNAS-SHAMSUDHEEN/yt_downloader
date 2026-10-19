@@ -5,9 +5,13 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import urllib.parse
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 import yt_dlp
 from fastapi import FastAPI, HTTPException
@@ -52,10 +56,77 @@ MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", 2))
 VALID_VIDEO_QUALITIES = {"best", "1080", "720", "480", "360"}
 VALID_AUDIO_QUALITIES = {"best", "320", "192", "128"}
 
-# FIX #1: asyncio.Semaphore must be created inside the running event loop,
-# NOT at module level. Module-level creation causes DeprecationWarning in
-# Python 3.10 and RuntimeError in Python 3.12+.
 _download_semaphore: asyncio.Semaphore | None = None
+
+# --- Task Store for Live Progress Tracking ------------------------------------
+
+_tasks: dict[str, dict[str, Any]] = {}
+_tasks_lock = threading.Lock()
+
+ANSI_REGEX = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+
+def _clean_ansi(text: str) -> str:
+    """Remove ANSI escape codes from yt-dlp formatted strings."""
+    return ANSI_REGEX.sub("", text).strip()
+
+
+def _create_task(task_id: str) -> dict[str, Any]:
+    with _tasks_lock:
+        task = {
+            "task_id": task_id,
+            "status": "starting",
+            "progress": 0.0,
+            "speed": "",
+            "eta": "",
+            "message": "Connecting...",
+            "error": None,
+            "filename": None,
+            "file_path": None,
+            "tmp_dir": None,
+            "media_type": None,
+            "created_at": time.time(),
+        }
+        _tasks[task_id] = task
+        return task
+
+
+def _get_task(task_id: str) -> dict[str, Any] | None:
+    with _tasks_lock:
+        task = _tasks.get(task_id)
+        return dict(task) if task else None
+
+
+def _update_task(task_id: str, **kwargs) -> None:
+    with _tasks_lock:
+        if task_id in _tasks:
+            _tasks[task_id].update(kwargs)
+
+
+def _delete_task(task_id: str) -> None:
+    with _tasks_lock:
+        _tasks.pop(task_id, None)
+
+
+async def _cleanup_expired_tasks_loop():
+    """Periodically clean up task dirs abandoned by users after 10 minutes."""
+    while True:
+        try:
+            await asyncio.sleep(60)
+            now = time.time()
+            expired = []
+            with _tasks_lock:
+                for tid, t in list(_tasks.items()):
+                    if now - t.get("created_at", now) > 600:
+                        expired.append((tid, t.get("tmp_dir")))
+            for tid, tdir in expired:
+                if tdir:
+                    shutil.rmtree(tdir, ignore_errors=True)
+                _delete_task(tid)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning("Error in task cleanup loop: %s", e)
 
 
 # --- Lifespan ------------------------------------------------------------------
@@ -65,11 +136,13 @@ async def lifespan(app: FastAPI):
     """Initialise async primitives inside the running event loop."""
     global _download_semaphore
     _download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+    cleanup_task = asyncio.create_task(_cleanup_expired_tasks_loop())
     logger.info(
         "Startup complete - ffmpeg=%s ffprobe=%s max_concurrent=%d",
         check_ffmpeg(), check_ffprobe(), MAX_CONCURRENT_DOWNLOADS,
     )
     yield
+    cleanup_task.cancel()
     logger.info("Shutdown complete.")
 
 
@@ -249,6 +322,217 @@ def health():
     }
 
 
+def make_progress_hook(task_id: str):
+    def hook(d: dict):
+        status = d.get("status")
+        if status == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            downloaded = d.get("downloaded_bytes", 0)
+            percent = 0.0
+            if total > 0:
+                percent = round((downloaded / total) * 100, 1)
+            else:
+                raw_p = _clean_ansi(str(d.get("_percent_str", ""))).replace("%", "")
+                try:
+                    percent = round(float(raw_p), 1)
+                except ValueError:
+                    percent = 0.0
+
+            speed = _clean_ansi(str(d.get("_speed_str", "")))
+            eta = _clean_ansi(str(d.get("_eta_str", "")))
+            display_percent = min(max(percent, 0.0), 95.0)
+
+            _update_task(
+                task_id,
+                status="downloading",
+                progress=display_percent,
+                speed=speed,
+                eta=eta,
+                downloaded_bytes=downloaded,
+                total_bytes=total,
+                message=f"Downloading {display_percent:.0f}%",
+            )
+        elif status == "finished":
+            _update_task(
+                task_id,
+                status="processing",
+                progress=96.0,
+                speed="",
+                eta="",
+                message="Processing audio/video streams...",
+            )
+    return hook
+
+
+def make_postprocessor_hook(task_id: str):
+    def hook(d: dict):
+        status = d.get("status")
+        pp_name = str(d.get("postprocessor", ""))
+        if status == "started":
+            msg = "Converting audio to MP3..." if "ExtractAudio" in pp_name else "Processing media..."
+            _update_task(
+                task_id,
+                status="processing",
+                progress=97.0,
+                speed="",
+                eta="",
+                message=msg,
+            )
+        elif status == "finished":
+            _update_task(
+                task_id,
+                status="processing",
+                progress=99.0,
+                speed="",
+                eta="",
+                message="Finalizing file...",
+            )
+    return hook
+
+
+async def _run_download_task(task_id: str, req: DownloadRequest):
+    tmp_dir = tempfile.mkdtemp(prefix="ytdl_")
+    _update_task(task_id, tmp_dir=tmp_dir)
+    try:
+        async with _download_semaphore:
+            loop = asyncio.get_running_loop()
+            progress_hook = make_progress_hook(task_id)
+            postprocessor_hook = make_postprocessor_hook(task_id)
+
+            output_path, filename = await loop.run_in_executor(
+                None,
+                _do_download_sync,
+                req.url.strip(),
+                req.type.strip().lower(),
+                req.quality.strip().lower() if req.quality else "best",
+                tmp_dir,
+                progress_hook,
+                postprocessor_hook,
+                task_id,
+            )
+
+        media_type = "audio/mpeg" if req.type.strip().lower() == "audio" else "video/mp4"
+        _update_task(
+            task_id,
+            status="complete",
+            progress=100.0,
+            message="Download completed ✓",
+            filename=filename,
+            file_path=output_path,
+            tmp_dir=tmp_dir,
+            media_type=media_type,
+        )
+    except HTTPException as exc:
+        _update_task(
+            task_id,
+            status="error",
+            error=str(exc.detail),
+            message=str(exc.detail),
+        )
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    except Exception as exc:
+        logger.exception("Task %s failed: %s", task_id, exc)
+        err_msg = str(exc)
+        _update_task(
+            task_id,
+            status="error",
+            error=err_msg,
+            message=err_msg,
+        )
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@app.post("/download/start")
+async def download_start(req: DownloadRequest):
+    url = req.url.strip()
+    download_type = req.type.strip().lower()
+
+    if not url:
+        raise HTTPException(status_code=400, detail="Please enter a YouTube URL.")
+
+    if not is_valid_youtube_url(url):
+        raise HTTPException(
+            status_code=400,
+            detail="Please enter a valid YouTube URL (youtube.com or youtu.be).",
+        )
+
+    if download_type not in ("video", "audio"):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid type. Must be 'video' or 'audio'.",
+        )
+
+    if not check_ffmpeg():
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "FFmpeg is required but was not found on PATH. "
+                "Please install FFmpeg: https://ffmpeg.org/download.html"
+            ),
+        )
+
+    quality = req.quality.strip().lower() if req.quality else "best"
+    if download_type == "video" and quality not in VALID_VIDEO_QUALITIES:
+        quality = "best"
+    if download_type == "audio" and quality not in VALID_AUDIO_QUALITIES:
+        quality = "best"
+
+    task_id = uuid.uuid4().hex
+    _create_task(task_id)
+
+    asyncio.create_task(_run_download_task(task_id, req))
+    return {"task_id": task_id}
+
+
+@app.get("/download/progress/{task_id}")
+def download_progress(task_id: str):
+    task = _get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Download session not found or expired.")
+    return {
+        "task_id": task_id,
+        "status": task["status"],
+        "progress": task["progress"],
+        "speed": task.get("speed", ""),
+        "eta": task.get("eta", ""),
+        "message": task.get("message", ""),
+        "filename": task.get("filename"),
+        "error": task.get("error"),
+    }
+
+
+@app.get("/download/file/{task_id}")
+def download_file(task_id: str):
+    task = _get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Download session not found or expired.")
+
+    if task["status"] != "complete":
+        if task["status"] == "error":
+            raise HTTPException(status_code=400, detail=task.get("error", "Download failed."))
+        raise HTTPException(status_code=409, detail="Download is still in progress.")
+
+    file_path = task.get("file_path")
+    if not file_path or not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File no longer exists.")
+
+    filename = task.get("filename", "download")
+    media_type = task.get("media_type", "application/octet-stream")
+    tmp_dir = task.get("tmp_dir")
+
+    def _cleanup_download_task():
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        _delete_task(task_id)
+
+    return FileResponse(
+        path=file_path,
+        media_type=media_type,
+        headers={"Content-Disposition": make_content_disposition(filename)},
+        background=BackgroundTask(_cleanup_download_task),
+    )
+
+
 @app.post("/download")
 async def download(req: DownloadRequest):
 
@@ -335,6 +619,9 @@ def _do_download_sync(
     download_type: str,
     quality: str,
     tmp_dir: str,
+    progress_hook: Any = None,
+    postprocessor_hook: Any = None,
+    task_id: str | None = None,
 ) -> tuple[str, str]:
     """
     Download YouTube media via yt-dlp.
@@ -348,8 +635,6 @@ def _do_download_sync(
 
     outtmpl = os.path.join(tmp_dir, "%(title)s.%(ext)s")
 
-    # FIX #5: Removed invalid 'js_runtimes' and 'remote_components' keys that
-    # are not recognised by yt-dlp and caused silent errors / warnings.
     base_opts: dict = {
         "quiet": True,
         "no_warnings": True,
@@ -360,6 +645,10 @@ def _do_download_sync(
         "max_filesize": MAX_FILESIZE_BYTES,
         "outtmpl": outtmpl,
     }
+    if progress_hook:
+        base_opts["progress_hooks"] = [progress_hook]
+    if postprocessor_hook:
+        base_opts["postprocessor_hooks"] = [postprocessor_hook]
 
     if download_type == "audio":
         bitrate = quality if quality != "best" else "0"
@@ -492,6 +781,13 @@ def _do_download_sync(
         return str(input_file), filename
 
     # Non-MP4 container: remux to MP4 (3 escalating attempts)
+    if task_id:
+        _update_task(
+            task_id,
+            status="processing",
+            progress=98.0,
+            message="Optimizing video format...",
+        )
     output_file = tmp_path / f"{title}_out.mp4"
 
     def _run_ffmpeg(cmd: list, timeout: int) -> bool:
