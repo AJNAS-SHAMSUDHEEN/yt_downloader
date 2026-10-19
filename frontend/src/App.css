@@ -378,6 +378,12 @@ body {
   border: 1px solid rgba(77, 255, 145, 0.2);
 }
 
+.status-loading {
+  background: rgba(255, 214, 0, 0.06);
+  color: var(--text-muted);
+  border: 1px solid rgba(255, 214, 0, 0.15);
+}
+
 /* ─── Tips ─────────────────────────────────────── */
 
 .tips {

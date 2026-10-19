@@ -101,9 +101,17 @@ export default function App() {
       const contentDisposition = response.headers.get('Content-Disposition') || '';
       let filename = type === 'audio' ? 'audio.mp3' : 'video.mp4';
 
-      const match = contentDisposition.match(/filename\*?=(?:UTF-8'')?["']?([^"';\r\n]+)/i);
-      if (match) {
-        filename = decodeURIComponent(match[1].replace(/['"]/g, ''));
+      // Prefer RFC 5987 filename* (percent-encoded UTF-8) over ASCII filename.
+      // Pattern: filename*=UTF-8''<percent-encoded>
+      const rfc5987Match = contentDisposition.match(/filename\*=UTF-8''([^;\r\n]+)/i);
+      if (rfc5987Match) {
+        filename = decodeURIComponent(rfc5987Match[1].trim());
+      } else {
+        // Fallback: plain filename="..."
+        const asciiMatch = contentDisposition.match(/filename="([^"]+)"/i);
+        if (asciiMatch) {
+          filename = asciiMatch[1];
+        }
       }
 
       const blobUrl = URL.createObjectURL(blob);
@@ -258,8 +266,17 @@ export default function App() {
           </button>
 
           {/* Status / Error */}
-          {status !== STATUS.IDLE && !isLoading && (
-            <div className={`status-bar ${status === STATUS.ERROR ? 'status-error' : status === STATUS.DONE ? 'status-done' : ''}`}>
+          {status !== STATUS.IDLE && (
+            <div
+              className={`status-bar ${
+                status === STATUS.ERROR
+                  ? 'status-error'
+                  : status === STATUS.DONE
+                  ? 'status-done'
+                  : 'status-loading'
+              }`}
+              aria-live="polite"
+            >
               {status === STATUS.ERROR ? (
                 <>
                   <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
@@ -268,7 +285,7 @@ export default function App() {
                   </svg>
                   {errorMsg}
                 </>
-              ) : (
+              ) : status === STATUS.DONE ? (
                 <>
                   <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
                     <circle cx="8" cy="8" r="7" stroke="currentColor" strokeWidth="1.5" />
@@ -276,7 +293,7 @@ export default function App() {
                   </svg>
                   {STATUS_MESSAGES[status]}
                 </>
-              )}
+              ) : null}
             </div>
           )}
         </main>
