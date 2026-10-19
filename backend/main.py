@@ -644,6 +644,11 @@ def _do_download_sync(
         "noplaylist": True,
         "max_filesize": MAX_FILESIZE_BYTES,
         "outtmpl": outtmpl,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "ios", "mweb", "web"],
+            }
+        },
     }
     if progress_hook:
         base_opts["progress_hooks"] = [progress_hook]
@@ -654,7 +659,7 @@ def _do_download_sync(
         bitrate = quality if quality != "best" else "0"
         ydl_opts = {
             **base_opts,
-            "format": "bestaudio/best",
+            "format": "bestaudio/b/best",
             "postprocessors": [
                 {
                     "key": "FFmpegExtractAudio",
@@ -665,18 +670,20 @@ def _do_download_sync(
         }
     else:
         if quality == "best":
-            fmt = "bv*+ba/best"
+            fmt = "bv*+ba/b/best"
         else:
             height = int(quality)
             fmt = (
                 f"bv*[height<={height}]+ba/"
                 f"b[height<={height}]/"
-                f"bv*+ba/best"
+                f"bv*+ba/"
+                f"b/"
+                f"best"
             )
         ydl_opts = {
             **base_opts,
             "format": fmt,
-            "format_sort": ["vcodec:h264", "acodec:m4a", "ext:mp4"],
+            "format_sort": ["res", "vcodec:h264", "acodec:m4a", "ext:mp4"],
             "merge_output_format": "mp4",
         }
 
@@ -715,10 +722,14 @@ def _do_download_sync(
         msg = str(exc)
         logger.error("yt-dlp DownloadError: %s", _clean_ytdlp_error(msg))
 
-        if "Sign in to confirm" in msg or "bot" in msg.lower():
+        if (
+            "Sign in to confirm" in msg
+            or "bot" in msg.lower()
+            or "failed to extract any player response" in msg.lower()
+        ):
             raise HTTPException(
                 status_code=403,
-                detail="YouTube requested bot verification. Try again later or provide cookies.",
+                detail="YouTube requested bot verification for this server IP. Providing cookies or retrying resolves this.",
             )
         if "Video unavailable" in msg or "not available" in msg.lower():
             raise HTTPException(status_code=400, detail="This video is unavailable.")
